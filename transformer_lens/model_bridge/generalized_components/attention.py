@@ -491,6 +491,20 @@ class AttentionBridge(GeneralizedComponent):
             raise ValueError(f"Unexpected Q tensor shape: {q.shape}. Expected 3D or 4D.")
         return q, k, v, batch_size, seq_len, head_dim
 
+    def _apply_rotary_hooks(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fire hook_rot_q / hook_rot_k on Q and K right after RoPE, [batch, heads, seq, head_dim].
+
+        For reconstructed attention that applies RoPE itself; the hooks exist only on
+        rotary configs.
+        """
+        if hasattr(self, "hook_rot_q"):
+            q = self.hook_rot_q(q)
+        if hasattr(self, "hook_rot_k"):
+            k = self.hook_rot_k(k)
+        return q, k
+
     def _apply_attn_dropout(self, attn_weights: torch.Tensor) -> torch.Tensor:
         """Apply attention dropout from the original HF component if present."""
         if self.original_component is not None:
