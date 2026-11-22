@@ -472,7 +472,8 @@ class ActivationCache:
         )
         if block_type in ("mlp", "moe"):
             return f"{layer}_mlp_out"
-        if block_type in ("attention", "full_attention"):
+        # transformers >= 5.23 reports RecurrentGemma's local attention as sliding_attention.
+        if block_type in ("attention", "full_attention", "sliding_attention"):
             return f"{layer}_attn_out"
         return f"{layer}_{name}_out"
 
