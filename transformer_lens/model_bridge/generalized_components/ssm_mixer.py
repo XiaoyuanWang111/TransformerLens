@@ -1,7 +1,10 @@
 """Wrap-don't-reimplement bridge for HF's MambaMixer (Mamba-1), plus S6 effective attention."""
-from typing import Any, NamedTuple, Optional
+import contextlib
+import inspect
+from typing import Any, Iterator, NamedTuple, Optional
 
 import torch
+from torch.overrides import TorchFunctionMode
 
 from transformer_lens.ActivationCache import ActivationCache
 from transformer_lens.hook_points import HookPoint
@@ -23,6 +26,118 @@ def _weightless_rms(x: torch.Tensor, eps: float) -> torch.Tensor:
     return (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)).to(dtype)
 
 
+# Module-level selective-scan functions that came with the inline dt product
+# (transformers >= 5.15); the product is taken right before the first of them runs.
+_SCAN_FNS = ("mamba_selective_scan", "mamba_selective_state_update")
+
+
+class _DtProjMatmulMode(TorchFunctionMode):
+    """Fire ``dt_proj``'s hooks on transformers' inline ``dt_proj.weight @ time_step``.
+
+    From transformers 5.15 the Mamba-1 mixers (Mamba, FalconMamba, Jamba) no
+    longer call ``self.dt_proj(time_step)``. They compute
+    ``self.dt_proj.weight @ time_step.transpose(1, 2)`` and pass the bias to the
+    selective scan, which adds it before the softplus. This mode intercepts only
+    a matmul whose left operand is this ``dt_proj``'s weight:
+
+    - ``hook_in`` sees the time step ``[batch, seq, rank]``, as ``dt_proj``'s input;
+    - ``hook_out`` sees ``weight @ time_step + bias`` as ``[batch, seq, channels]``,
+      the value ``dt_proj(time_step)`` returns and the scan uses.
+
+    Unedited, the product transformers computed is returned as is, so the mixer
+    output is bit-exact. An edit on ``hook_out`` is handed back with the bias
+    taken off, since the scan adds it again; it lands up to float rounding.
+    """
+
+    _MATMULS = frozenset({torch.matmul, torch.Tensor.matmul, torch.Tensor.__matmul__})
+
+    def __init__(self, dt_proj: GeneralizedComponent, linear: torch.nn.Linear) -> None:
+        super().__init__()
+        self.dt_proj = dt_proj
+        self.linear = linear
+
+    def __torch_function__(self, func: Any, types: Any, args: Any = (), kwargs: Any = None) -> Any:
+        kwargs = kwargs or {}
+        if (
+            func not in self._MATMULS
+            or kwargs
+            or len(args) != 2
+            or args[0] is not self.linear.weight
+            or not isinstance(args[1], torch.Tensor)
+            or args[1].dim() != 3
+        ):
+            return func(*args, **kwargs)
+        # The mode is off inside this method, so the hooks run unintercepted.
+        bias = self.linear.bias
+        time_step = args[1].transpose(1, 2)
+        hooked_in = self.dt_proj.hook_in(time_step)
+        if hooked_in is time_step:  # unedited, or edited in place (a view of args[1])
+            product = func(*args)
+        else:
+            product = func(args[0], hooked_in.transpose(1, 2))
+        full = product if bias is None else product + bias.to(product.dtype)[:, None]
+        full = full.transpose(1, 2)
+        version = full._version
+        hooked_out = self.dt_proj.hook_out(full)
+        if hooked_out is full and full._version == version:
+            return product
+        edited = hooked_out.transpose(1, 2)
+        return edited if bias is None else edited - bias.to(edited.dtype)[:, None]
+
+
+@contextlib.contextmanager
+def route_dt_proj_matmul(hf_module: Any, dt_proj_attr: str = "dt_proj") -> Iterator[None]:
+    """While active, fire the ``dt_proj`` bridge's hooks on transformers' inline product.
+
+    A no-op unless ``dt_proj`` is a bridge around an ``nn.Linear`` and the module
+    that defines the HF forward has the selective-scan functions of
+    transformers >= 5.15. The mode covers the forward up to the scan: the first
+    call into a scan function leaves it, so the scan's per-step ops do not pay
+    for Python dispatch.
+    """
+    dt_proj = getattr(hf_module, dt_proj_attr, None)
+    linear = getattr(dt_proj, "original_component", None)
+    forward = getattr(type(hf_module), "forward", None)
+    namespace = getattr(inspect.unwrap(forward), "__globals__", None) if forward else None
+    scans = {
+        name: namespace[name]
+        for name in _SCAN_FNS
+        if namespace is not None and callable(namespace.get(name))
+    }
+    if (
+        not isinstance(dt_proj, GeneralizedComponent)
+        or not isinstance(linear, torch.nn.Linear)
+        or not scans
+    ):
+        yield
+        return
+    assert namespace is not None
+    mode = _DtProjMatmulMode(dt_proj, linear)
+    active = False
+
+    def leave() -> None:
+        nonlocal active
+        if active:
+            active = False
+            mode.__exit__(None, None, None)
+
+    def leaving(scan: Any) -> Any:
+        def routed(*args: Any, **kwargs: Any) -> Any:
+            leave()
+            return scan(*args, **kwargs)
+
+        return routed
+
+    namespace.update({name: leaving(scan) for name, scan in scans.items()})
+    mode.__enter__()
+    active = True
+    try:
+        yield
+    finally:
+        leave()
+        namespace.update(scans)
+
+
 class _S6Terms(NamedTuple):
     """S6 intermediates reconstructed from cached Mamba-1 hooks (per-channel)."""
 
@@ -42,6 +157,9 @@ class SSMMixerBridge(SSMStateHookMixin, GeneralizedComponent):
 
     Decode-step caveat: ``conv1d.hook_out`` fires only on prefill during
     stateful generation; see ``DepthwiseConv1DBridge`` for the reason.
+
+    transformers >= 5.15 computes ``dt_proj.weight @ time_step`` inline instead
+    of calling ``dt_proj``; ``route_dt_proj_matmul`` fires its hooks there.
     """
 
     hook_aliases = {
@@ -84,8 +202,11 @@ class SSMMixerBridge(SSMStateHookMixin, GeneralizedComponent):
             output: Any = self._eager_scan_forward(hidden_states, kwargs.get("attention_mask"))
         else:
             # transformers >= 5.15 calls a module-level causal_conv1d_fn with
-            # conv1d's weight; route it through the conv1d bridge so its hooks fire.
-            with route_causal_conv1d(self.original_component, "conv1d"):
+            # conv1d's weight and computes dt_proj.weight @ time_step inline;
+            # route both through the bridges so their hooks fire.
+            with route_causal_conv1d(self.original_component, "conv1d"), route_dt_proj_matmul(
+                self.original_component, "dt_proj"
+            ):
                 output = self.original_component(*args, **kwargs)
 
         # Hook the primary output tensor, preserving tuple structure
