@@ -7,8 +7,9 @@ are withheld) and GatedDeltaNet linear-attention layers (pre-norm, with
 separate q/k/v short convolutions). Attention stays HF-native; the
 OlmoHybrid GatedDeltaNet variant differs from Qwen3Next's (separate
 q/k/v conv states), so it is delegated opaquely rather than through
-GatedDeltaNetBridge's reimplementation. Generation uses the model's own
-OlmoHybridDynamicCache.
+GatedDeltaNetBridge's reimplementation. Generation uses the cache the model's
+own forward builds (OlmoHybridDynamicCache up to transformers 5.14, DynamicCache
+from 5.15).
 """
 
 from typing import Any
@@ -126,9 +127,17 @@ class OlmoHybridArchitectureAdapter(ArchitectureAdapter):
         device: Any,
         dtype: Any,
     ) -> Any:
-        """OLMo Hybrid keeps per-layer q/k/v conv states in its own cache class."""
-        from transformers.models.olmo_hybrid.modeling_olmo_hybrid import (
-            OlmoHybridDynamicCache,
-        )
+        """Build the cache OLMo Hybrid's own forward would build.
 
-        return OlmoHybridDynamicCache(config=hf_model.config)
+        Up to transformers 5.14 that is ``OlmoHybridDynamicCache``, which keeps the
+        per-layer q/k/v conv states. transformers 5.15 (huggingface/transformers#47630)
+        removed it, and the model builds ``DynamicCache(config=...)`` instead.
+        """
+        from transformers.cache_utils import DynamicCache
+        from transformers.models.olmo_hybrid import modeling_olmo_hybrid
+
+        cache_cls = getattr(modeling_olmo_hybrid, "OlmoHybridDynamicCache", None)
+        if cache_cls is not None:
+            return cache_cls(config=hf_model.config)
+
+        return DynamicCache(config=hf_model.config)

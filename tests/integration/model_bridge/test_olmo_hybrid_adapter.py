@@ -202,3 +202,36 @@ class TestOlmoHybridGeneration:
         text = bridge.generate("Hello", max_new_tokens=5, do_sample=False, verbose=False)
         assert isinstance(text, str)
         assert text.startswith("Hello")
+
+    def test_stateful_cache_matches_hf_generate(self, bridge):
+        """Cached greedy tokens equal HF's and the uncached loop's.
+
+        transformers 5.15 removed OlmoHybridDynamicCache; the adapter then builds the
+        DynamicCache the model's own forward builds.
+        """
+        tokens = torch.tensor([[791, 6864, 315, 9822, 374, 12366]])
+        new = 6
+        with torch.no_grad():
+            expected = bridge.original_model.generate(
+                tokens, max_new_tokens=new, do_sample=False, eos_token_id=[]
+            )
+            cached = bridge.generate(
+                tokens,
+                max_new_tokens=new,
+                do_sample=False,
+                use_past_kv_cache=True,
+                stop_at_eos=False,
+                verbose=False,
+                return_type="tokens",
+            )
+            uncached = bridge.generate(
+                tokens,
+                max_new_tokens=new,
+                do_sample=False,
+                use_past_kv_cache=False,
+                stop_at_eos=False,
+                verbose=False,
+                return_type="tokens",
+            )
+        assert cached.tolist() == expected.tolist()
+        assert uncached.tolist() == expected.tolist()
