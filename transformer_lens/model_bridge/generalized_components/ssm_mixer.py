@@ -271,14 +271,17 @@ class SSMMixerBridge(SSMStateHookMixin, GeneralizedComponent):
         # Jamba (and forks) apply RMSNorm to dt/B/C after x_proj; stock Mamba-1 does not.
         ssm_params = oc.x_proj(x.transpose(1, 2))  # [b, seq, dt_rank + 2*state]
         time_step, B, C = ssm_params.split([dt_rank, state, state], dim=-1)  # B, C: [b, seq, state]
-        # FalconMamba applies a parameter-free RMS to B/C/dt before dt_proj.
+        # FalconMamba applies a parameter-free RMS to B/C/dt before dt_proj. From
+        # transformers 5.15 its mixer holds that RMS as dt/b/c_layernorm modules,
+        # which the call below applies; apply the function only without them.
         rms_eps = getattr(oc, "rms_eps", None)
-        if rms_eps is not None:
+        if rms_eps is not None and getattr(oc, "dt_layernorm", None) is None:
             B = _weightless_rms(B, rms_eps)
             C = _weightless_rms(C, rms_eps)
             time_step = _weightless_rms(time_step, rms_eps)
 
-        # Jamba adds module-based dt/B/C layernorms (no-op when absent).
+        # Jamba (and FalconMamba from transformers 5.15) has module-based dt/B/C
+        # norms (no-op when absent).
         time_step, B, C = self._apply_selective_param_norms(oc, time_step, B, C)
         dt = torch.nn.functional.softplus(oc.dt_proj(time_step)).transpose(1, 2).float()
         A = -torch.exp(self.A_log.float())  # [d_inner, state]
