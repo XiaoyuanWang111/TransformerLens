@@ -62,22 +62,65 @@ class TestFalconMambaEagerScan:
         rel = (eager - base).abs().max().item() / max(base.abs().max().item(), 1e-8)
         assert rel < 1e-3, f"eager vs fused rel diff {rel:.2e}"
 
-    def test_rms_is_load_bearing(self, bridge, sample_tokens):
-        """Counterfactual: hiding rms_eps from the eager scan must degrade parity,
-        proving the RMS branch is actually engaged for FalconMamba."""
+    def test_eager_scan_applies_the_rms_once(self, bridge, sample_tokens):
+        """With a large eps, RMS applied twice differs visibly from RMS applied
+        once, so eager-vs-fused parity holds only if the eager scan applies
+        FalconMamba's RMS once (from transformers 5.15 the mixer also holds it
+        as dt/b/c_layernorm modules)."""
         mixers = _mixers(bridge)
-        saved = [m.original_component.rms_eps for m in mixers]
+        norms = ("dt_layernorm", "b_layernorm", "c_layernorm")
+        saved = [
+            (
+                m.original_component.rms_eps,
+                [getattr(getattr(m.original_component, n, None), "eps", None) for n in norms],
+            )
+            for m in mixers
+        ]
+
+        def set_eps(m, eps, module_eps):
+            m.original_component.rms_eps = eps
+            for n, e in zip(norms, module_eps):
+                if getattr(m.original_component, n, None) is not None:
+                    getattr(m.original_component, n).eps = e
+
+        with torch.no_grad():
+            for m in mixers:
+                set_eps(m, 0.5, [0.5] * len(norms))
+            try:
+                base = bridge(sample_tokens, use_cache=False)
+                for m in mixers:
+                    m.eager_scan = True
+                eager = bridge(sample_tokens, use_cache=False)
+            finally:
+                for m, (eps, module_eps) in zip(mixers, saved):
+                    m.eager_scan = False
+                    set_eps(m, eps, module_eps)
+        rel = (eager - base).abs().max().item() / max(base.abs().max().item(), 1e-8)
+        assert rel < 1e-3, f"eager vs fused rel diff {rel:.2e}"
+
+    def test_rms_is_load_bearing(self, bridge, sample_tokens):
+        """Counterfactual: hiding the RMS from the eager scan must degrade parity,
+        proving the RMS branch is actually engaged for FalconMamba. The RMS is
+        keyed on rms_eps, and from transformers 5.15 also held as the mixer's
+        dt/b/c_layernorm modules, so both are hidden."""
+        mixers = _mixers(bridge)
+        norms = ("rms_eps", "dt_layernorm", "b_layernorm", "c_layernorm")
+        saved = [{n: getattr(m.original_component, n, None) for n in norms} for m in mixers]
         with torch.no_grad():
             base = bridge(sample_tokens, use_cache=False)
             for m in mixers:
                 m.eager_scan = True
-                m.original_component.rms_eps = None
+                for n in norms:
+                    if hasattr(m.original_component, n):
+                        setattr(m.original_component, n, None)
             try:
                 broken = bridge(sample_tokens, use_cache=False)
             finally:
-                for m, eps in zip(mixers, saved):
+                for m, values in zip(mixers, saved):
                     m.eager_scan = False
-                    m.original_component.rms_eps = eps
+                    for n, value in values.items():
+                        if value is not None:
+                            setattr(m.original_component, n, value)
         rel = (broken - base).abs().max().item() / max(base.abs().max().item(), 1e-8)
         assert rel > 1e-3, f"eager scan without RMS still matched (rel {rel:.2e})"
 
