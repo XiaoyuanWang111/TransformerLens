@@ -4737,9 +4737,12 @@ class TransformerBridge(BridgeCore, HookIntrospectionMixin, nn.Module):
             {
                 "max_new_tokens": max_new_tokens,
                 "do_sample": do_sample,
-                "pad_token_id": self.tokenizer.eos_token_id,
             }
         )
+        # A bridge built without a tokenizer takes token input; HF then uses the
+        # model's generation_config for the pad id.
+        if self.tokenizer is not None:
+            generation_kwargs["pad_token_id"] = self.tokenizer.eos_token_id
         # Temperature only matters when sampling. Whisper's generate samples whenever a
         # temperature above 0 is passed, so a greedy call must not send one.
         if do_sample:
@@ -4758,7 +4761,7 @@ class TransformerBridge(BridgeCore, HookIntrospectionMixin, nn.Module):
             generation_kwargs["eos_token_id"] = (
                 eos_token_id if isinstance(eos_token_id, int) else list(eos_token_id)
             )
-        elif self.tokenizer.eos_token_id is not None:
+        elif self.tokenizer is not None and self.tokenizer.eos_token_id is not None:
             generation_kwargs["eos_token_id"] = self.tokenizer.eos_token_id
 
         if pixel_values is not None:

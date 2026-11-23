@@ -91,6 +91,57 @@ def test_stateful_fallback_eos_list_reaches_hf_generate(monkeypatch):
     assert captured["eos_token_id"] == [5, 7]
 
 
+def test_hf_generate_without_tokenizer_leaves_special_ids_to_hf(monkeypatch):
+    """With no tokenizer there is no pad/EOS id to send, so the model's
+    generation_config supplies them."""
+    bridge = _tiny_bridge()
+    assert bridge.tokenizer is None
+    captured: dict = {}
+
+    def spy(input_ids, **kwargs):
+        captured.update(kwargs)
+        return input_ids
+
+    monkeypatch.setattr(bridge.original_model, "generate", spy)
+    bridge.hf_generate(
+        torch.tensor([[1, 2]]), max_new_tokens=1, do_sample=False, return_type="tokens"
+    )
+    assert "pad_token_id" not in captured
+    assert "eos_token_id" not in captured
+
+
+def test_hf_generate_without_tokenizer_matches_hf():
+    bridge = _tiny_bridge()
+    prompt = torch.tensor([[1, 2, 3]])
+    out = bridge.hf_generate(
+        prompt, max_new_tokens=4, do_sample=False, stop_at_eos=False, return_type="tokens"
+    )
+    expected = bridge.original_model.generate(
+        prompt, max_new_tokens=4, do_sample=False, eos_token_id=None
+    )
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+def test_stateful_fallback_without_tokenizer_matches_hf():
+    """Token input needs no tokenizer on the hooked loop, so the stateful
+    fallback must not need one either."""
+    bridge = _tiny_bridge()
+    bridge.cfg.is_stateful = True
+    prompt = torch.tensor([[1, 2, 3]])
+    out = bridge.generate(
+        prompt,
+        max_new_tokens=4,
+        stop_at_eos=False,
+        use_past_kv_cache=False,
+        do_sample=False,
+        verbose=False,
+    )
+    expected = bridge.original_model.generate(
+        prompt, max_new_tokens=4, do_sample=False, eos_token_id=None
+    )
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
 def test_hf_generate_normalizes_eos_sequence_to_list(monkeypatch):
     bridge = _tiny_bridge()
     bridge.tokenizer = SimpleNamespace(eos_token_id=0)
