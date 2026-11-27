@@ -1,7 +1,8 @@
 """Wrap-don't-reimplement bridge for HF's MambaMixer (Mamba-1), plus S6 effective attention."""
 import contextlib
 import inspect
-from typing import Any, Iterator, NamedTuple, Optional
+import threading
+from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional
 
 import torch
 from torch.overrides import TorchFunctionMode
@@ -85,6 +86,85 @@ class _DtProjMatmulMode(TorchFunctionMode):
         return edited if bias is None else edited - bias.to(edited.dtype)[:, None]
 
 
+class _DtRoute:
+    """One ``route_dt_proj_matmul`` context: its mode, active on this thread until the scan."""
+
+    def __init__(self, namespace: Dict[str, Any], mode: _DtProjMatmulMode) -> None:
+        self.namespace = namespace
+        self.mode = mode
+        self.active = False
+
+    def enter(self) -> None:
+        self.mode.__enter__()
+        self.active = True
+
+    def leave(self) -> None:
+        if self.active:
+            self.active = False
+            self.mode.__exit__(None, None, None)
+
+
+class _InstalledScanDispatch:
+    """The stand-ins for one modeling file's scan functions while any route uses them."""
+
+    def __init__(self, namespace: Dict[str, Any], originals: Dict[str, Callable[..., Any]]) -> None:
+        self.originals = originals
+        self.users = 0
+        self.functions = {name: self._leaving(namespace, scan) for name, scan in originals.items()}
+
+    @staticmethod
+    def _leaving(namespace: Dict[str, Any], scan: Callable[..., Any]) -> Callable[..., Any]:
+        def dispatch(*args: Any, **kwargs: Any) -> Any:
+            # Torch function modes are per thread, so leave only the calling thread's.
+            for route in reversed(_thread_dt_routes()):
+                if route.namespace is namespace:
+                    route.leave()
+            return scan(*args, **kwargs)
+
+        return dispatch
+
+
+_SCAN_LOCK = threading.Lock()
+# Keyed by id() of the modeling file's globals.
+_INSTALLED_SCANS: Dict[int, _InstalledScanDispatch] = {}
+_DT_THREAD_STATE = threading.local()
+
+
+def _thread_dt_routes() -> List[_DtRoute]:
+    routes = getattr(_DT_THREAD_STATE, "routes", None)
+    if routes is None:
+        routes = []
+        _DT_THREAD_STATE.routes = routes
+    return routes
+
+
+def _install_scan_dispatch(namespace: Dict[str, Any]) -> Optional[_InstalledScanDispatch]:
+    with _SCAN_LOCK:
+        installed = _INSTALLED_SCANS.get(id(namespace))
+        if installed is None:
+            originals = {
+                name: namespace[name] for name in _SCAN_FNS if callable(namespace.get(name))
+            }
+            if not originals:
+                return None
+            installed = _InstalledScanDispatch(namespace, originals)
+            namespace.update(installed.functions)
+            _INSTALLED_SCANS[id(namespace)] = installed
+        installed.users += 1
+        return installed
+
+
+def _release_scan_dispatch(namespace: Dict[str, Any], installed: _InstalledScanDispatch) -> None:
+    with _SCAN_LOCK:
+        installed.users -= 1
+        if installed.users == 0:
+            del _INSTALLED_SCANS[id(namespace)]
+            for name, function in installed.functions.items():
+                # Leave alone a function that someone else has put there since.
+                if namespace.get(name) is function:
+                    namespace[name] = installed.originals[name]
+
+
 @contextlib.contextmanager
 def route_dt_proj_matmul(hf_module: Any, dt_proj_attr: str = "dt_proj") -> Iterator[None]:
     """While active, fire the ``dt_proj`` bridge's hooks on transformers' inline product.
@@ -92,50 +172,37 @@ def route_dt_proj_matmul(hf_module: Any, dt_proj_attr: str = "dt_proj") -> Itera
     A no-op unless ``dt_proj`` is a bridge around an ``nn.Linear`` and the module
     that defines the HF forward has the selective-scan functions of
     transformers >= 5.15. The mode covers the forward up to the scan: the first
-    call into a scan function leaves it, so the scan's per-step ops do not pay
-    for Python dispatch.
+    call into a scan function on this thread leaves it, so the scan's per-step ops
+    do not pay for Python dispatch. The scan functions are replaced while any
+    thread is inside such a context and put back when the last one leaves; a scan
+    call leaves only the calling thread's modes.
     """
     dt_proj = getattr(hf_module, dt_proj_attr, None)
     linear = getattr(dt_proj, "original_component", None)
     forward = getattr(type(hf_module), "forward", None)
     namespace = getattr(inspect.unwrap(forward), "__globals__", None) if forward else None
-    scans = {
-        name: namespace[name]
-        for name in _SCAN_FNS
-        if namespace is not None and callable(namespace.get(name))
-    }
     if (
-        not isinstance(dt_proj, GeneralizedComponent)
+        namespace is None
+        or not isinstance(dt_proj, GeneralizedComponent)
         or not isinstance(linear, torch.nn.Linear)
-        or not scans
     ):
         yield
         return
-    assert namespace is not None
-    mode = _DtProjMatmulMode(dt_proj, linear)
-    active = False
+    installed = _install_scan_dispatch(namespace)
+    if installed is None:
+        yield
+        return
 
-    def leave() -> None:
-        nonlocal active
-        if active:
-            active = False
-            mode.__exit__(None, None, None)
-
-    def leaving(scan: Any) -> Any:
-        def routed(*args: Any, **kwargs: Any) -> Any:
-            leave()
-            return scan(*args, **kwargs)
-
-        return routed
-
-    namespace.update({name: leaving(scan) for name, scan in scans.items()})
-    mode.__enter__()
-    active = True
+    route = _DtRoute(namespace, _DtProjMatmulMode(dt_proj, linear))
+    routes = _thread_dt_routes()
+    routes.append(route)
     try:
+        route.enter()
         yield
     finally:
-        leave()
-        namespace.update(scans)
+        route.leave()
+        routes.remove(route)
+        _release_scan_dispatch(namespace, installed)
 
 
 class _S6Terms(NamedTuple):

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import sys
+import threading
 
 import pytest
 import torch
@@ -135,12 +136,13 @@ def test_route_ends_when_the_scan_starts_and_restores_the_scan() -> None:
     dt_proj.hook_in.add_hook(lambda tensor, hook: calls.append(hook.name))
     weight = dt_proj.original_component.weight
     product_in_scan = lambda: weight @ torch.randn(2, RANK, 5)  # noqa: E731
+    scan_before = sys.modules[__name__].mamba_selective_scan
     with torch.no_grad():
         with route_dt_proj_matmul(mixer, "dt_proj"):
             mixer(torch.randn(2, 5, RANK), during=product_in_scan)
         product_in_scan()
     assert len(calls) == 1
-    assert sys.modules[__name__].mamba_selective_scan is mamba_selective_scan
+    assert sys.modules[__name__].mamba_selective_scan is scan_before
 
 
 def test_route_restores_the_scan_and_leaves_the_mode_after_an_error() -> None:
@@ -152,12 +154,64 @@ def test_route_restores_the_scan_and_leaves_the_mode_after_an_error() -> None:
         raise RuntimeError("hook failed")
 
     dt_proj.hook_in.add_hook(fail)
+    scan_before = sys.modules[__name__].mamba_selective_scan
     with pytest.raises(RuntimeError, match="hook failed"):
         with torch.no_grad(), route_dt_proj_matmul(mixer, "dt_proj"):
             mixer(torch.randn(2, 5, RANK))
     dt_proj.original_component.weight @ torch.randn(2, RANK, 5)
     assert len(calls) == 1
-    assert sys.modules[__name__].mamba_selective_scan is mamba_selective_scan
+    assert sys.modules[__name__].mamba_selective_scan is scan_before
+
+
+def test_route_keeps_concurrent_forwards_apart() -> None:
+    """Thread B's route outlives thread A's: B's dt_proj hook still fires and the scan is put back."""
+    mixer_a, reference, dt_proj_a = _bridged_inline_mixer()
+    mixer_b, _, dt_proj_b = _bridged_inline_mixer()
+    seen: dict = {}
+    dt_proj_a.hook_in.add_hook(_record(seen, "a"))
+    dt_proj_b.hook_in.add_hook(_record(seen, "b"))
+    time_step = torch.randn(2, 5, RANK)
+    scan_before = sys.modules[__name__].mamba_selective_scan
+    a_entered, b_entered, a_left = threading.Event(), threading.Event(), threading.Event()
+    outputs: dict = {}
+    errors: list = []
+
+    def run_a() -> None:
+        try:
+            with torch.no_grad(), route_dt_proj_matmul(mixer_a, "dt_proj"):
+                a_entered.set()
+                assert b_entered.wait(10)
+                outputs["a"] = mixer_a(time_step)
+        except BaseException as exc:  # surfaced in the main thread below
+            errors.append(exc)
+        finally:
+            a_entered.set()
+            a_left.set()
+
+    def run_b() -> None:
+        try:
+            assert a_entered.wait(10)
+            with torch.no_grad(), route_dt_proj_matmul(mixer_b, "dt_proj"):
+                b_entered.set()
+                assert a_left.wait(10)
+                outputs["b"] = mixer_b(time_step)
+        except BaseException as exc:  # surfaced in the main thread below
+            errors.append(exc)
+        finally:
+            b_entered.set()
+
+    threads = [threading.Thread(target=run_a), threading.Thread(target=run_b)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    assert not errors, errors
+    assert set(seen) == {"a", "b"}
+    with torch.no_grad():
+        expected = reference(time_step)
+    torch.testing.assert_close(outputs["a"], expected, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(outputs["b"], expected, rtol=0.0, atol=0.0)
+    assert sys.modules[__name__].mamba_selective_scan is scan_before
 
 
 def test_route_is_a_no_op_without_a_dt_proj_bridge() -> None:
