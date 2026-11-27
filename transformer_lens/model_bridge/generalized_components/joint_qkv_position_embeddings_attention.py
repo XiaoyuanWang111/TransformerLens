@@ -183,6 +183,7 @@ class JointQKVPositionEmbeddingsAttentionBridge(
         if position_embeddings is not None and isinstance(position_embeddings, tuple):
             cos, sin = self._apply_position_embedding_hooks(position_embeddings)
             q, k = self._apply_rotary_pos_emb(q, k, cos, sin)
+            q, k = self._apply_rotary_hooks(q, k)
 
         # KV cache: extend K/V with cached positions.
         k, v = self._update_kv_cache(k, v, **kwargs)

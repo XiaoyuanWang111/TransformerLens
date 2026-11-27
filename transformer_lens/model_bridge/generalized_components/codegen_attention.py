@@ -358,6 +358,7 @@ class CodeGenAttentionBridge(JointQKVAttentionBridge):
             else:
                 q = _apply_rotary_pos_emb(q, sin, cos)
                 k = _apply_rotary_pos_emb(k, sin, cos)
+            q, k = self._apply_rotary_hooks(q, k)
 
         # ---- KV cache ----
         k, v = self._update_kv_cache(k, v, **kwargs)
